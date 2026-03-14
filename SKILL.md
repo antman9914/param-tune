@@ -88,7 +88,57 @@ cd TARGET_DIR && python {训练脚本}
 
 训练完成后，确认 logs/ 下出现了新的结果文件。
 
-**6d. 回到 Step 2，开始下一轮**
+**6d. 写入本轮运行日志**
+
+将本轮的完整分析结果写入：
+`~/.claude/skills/param-tune/memory/run_logs/round_{NNN}.md`
+
+其中 NNN = 当前 experiment_count（三位补零）。
+
+日志内容格式：
+
+```markdown
+# Round {NNN} — {ISO timestamp}
+
+## 实验配置
+| 参数 | 值 |
+|------|----|
+| {param_1} | {值} |
+| {param_2} | {值} |
+
+## 训练结果
+| 指标 | 值 |
+|------|----|
+| train_acc | {值} |
+| val_acc   | {值} |
+| train_loss | {值} |
+| val_loss   | {值} |
+| overfit_ratio | {值}（截断前）|
+| reward    | {值} |
+
+## 曲线诊断
+{Module 3 的一句话诊断}
+
+## 搜索状态
+- 阶段：{exploration / multi_focused}
+- 候选区域：{candidate_id 或 N/A}
+- 已完成实验数：{N}
+- 当前最优：{exp_id}（reward={值}）
+
+## 下一轮推荐
+| 参数 | 值 | 推荐理由 |
+|------|----|---------|
+| {param_1} | {值} | {理由} |
+```
+
+若本轮触发终止，在日志末尾追加：
+
+```markdown
+## 终止报告
+{全局最优实验的参数和 reward}
+```
+
+**6e. 回到 Step 2，开始下一轮**
 
 ---
 
