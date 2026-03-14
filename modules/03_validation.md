@@ -45,15 +45,23 @@
 ## 3.3 计算 Reward
 
 ```
-overfit_ratio = min(max(0, (val_loss_final - train_loss_final) / train_loss_final), 3.0)
-
-reward = 0.85 × primary_metric_normalized - 0.15 × overfit_ratio
+reward = primary_metric_normalized
 ```
 
 注意：
 - `primary_metric_normalized` 已统一为"越高越好"的 [0,1] 值
-- `overfit_ratio` 用 max(0,...) 截断，val_loss < train_loss 时不额外奖励
-- 若日志中无 train_loss，仅用 `reward = primary_metric_normalized`
+- reward 不含过拟合惩罚项，过拟合信息通过曲线诊断（3.2）传递给 Module 4 影响搜索方向
+
+**过拟合程度判断**（仅用于诊断，不影响 reward）：
+
+| 条件 | 判断 |
+|------|------|
+| val_loss - train_loss < 0.05 × train_loss | 无 |
+| val_loss 比 train_loss 高，但 val_acc 仍在提升 | 轻微，可接受 |
+| val_loss 先降后升（拐点明显） | 中等，建议增加正则化 |
+| val_loss 持续扩大且 val_acc 停滞或下降 | 严重，需增强正则化 |
+
+注意：**train_loss 极低（<0.05）时 loss 比值失去参考意义，以曲线形态和 val_acc 趋势为准。**
 
 输出本次评估结果：
 ```
@@ -61,15 +69,15 @@ reward = 0.85 × primary_metric_normalized - 0.15 × overfit_ratio
   primary_metric ({metric_name}) : {值}
   train_loss_final               : {值}
   val_loss_final                 : {值}
-  overfit_ratio                  : {值}
+  过拟合诊断                      : {无 / 轻微 / 中等 / 严重}
   curve_diagnosis                : {一句话}
   reward                         : {值}
 ```
 
 ## 3.4 Module 3 输出摘要
 
-- reward 值
+- reward 值（= primary_metric）
 - primary_metric 名称和值
-- 过拟合程度：无 / 轻微 / 中等 / 严重
+- 过拟合程度诊断（不影响 reward，传递给 Module 4 作为搜索方向参考）
 - 曲线诊断结论
 - 调参方向提示（传递给 Module 4）
