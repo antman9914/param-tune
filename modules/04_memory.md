@@ -2,36 +2,46 @@
 
 ## 4.1 将本次实验追加到历史日志
 
+**若当前轮次尚无训练结果（首次运行，Step 3 返回 reward = null）**：跳过 4.1–4.4，直接进入 4.5 生成推荐配置。
+
 将以下内容 append 到 `~/.claude/skills/param-tune/memory/experiment_log.jsonl`（每次一行）：
 
 ```json
 {
   "exp_id": "exp_NNN",
+  "candidate_id": "<exploration | candidate_A | candidate_B | ...>",
   "timestamp": "<ISO 8601>",
   "hyperparams": {
     "<param_1>": <值>,
     "<param_2>": <值>
   },
   "results": {
-    "train_loss_final": <值>,
-    "val_loss_final": <值>,
     "primary_metric_name": "<metric名>",
     "primary_metric_value": <值>,
-    "overfit_ratio": <值>,
-    "reward": <值>
+    "reward": <值>,
+    "overfitting_train_value": <值或null>,
+    "overfitting_val_value": <值或null>
   },
   "curve_diagnosis": "<Module 3 的一句话诊断>",
   "tuning_hint": "<Module 3 的调参方向提示>"
 }
 ```
 
+`overfitting_train_value` 和 `overfitting_val_value` 从 `metric_config.overfitting_diagnosis` 描述的字段读取；若 `overfitting_diagnosis.available = false`，则填 `null`。
+
 exp_id 编号 = experiment_count + 1，格式 exp_001, exp_002 ...
+
+追加完成后，将 `experiment_count` 加 1 并写回 `search_state.json`。
+
+`candidate_id` 取值规则：
+- exploration 阶段：填 `"exploration"`
+- multi_focused 阶段：填当前候选的 id（如 `"candidate_A"`）
 
 ## 4.2 历史趋势分析
 
 读取 `~/.claude/skills/param-tune/memory/experiment_log.jsonl` 的所有记录。
 
-若只有 1 条（当前轮首次），跳过此步直接进入 4.3。
+若记录数 ≤ 1，跳过此步直接进入 4.3。
 
 **对每个 tunable 参数做单参数影响分析**（若该参数有 ≥3 个不同取值）：
 - 列出取值 vs reward
@@ -61,15 +71,23 @@ experiment_count >= 5 → multi_focused（多起点 focused 搜索）
 
 2. 候选 A = reward 最高的实验
 
-3. 候选 B = 与候选 A 归一化距离最远的实验（欧氏距离）：
+3. 候选 B = 在满足质量门槛的实验中，与候选 A 归一化距离最远的实验（欧氏距离）：
    `dist(A, B) = sqrt(sum((norm_A_i - norm_B_i)^2))`
-   若所有其他实验与 A 的距离 < 0.2（归一化空间），则只保留 1 个候选（距离太近没有意义）
+
+   **质量门槛**：候选 B 的 anchor 实验必须满足 `reward >= candidate_A.reward × 0.95`。
+   排除不满足此条件的实验后再做最远点选择。
+
+   以下情况只保留 1 个候选（single-candidate 模式）：
+   - 所有满足质量门槛的其他实验与 A 的距离 < 0.2（归一化空间内距离太近）
+   - 没有任何实验满足质量门槛（其余实验 reward 均低于 candidate_A.reward × 0.95）
 
 4. 为每个候选分别计算 focus 范围：
    - log scale：`[anchor × 0.4, anchor × 2.5]`（大约 ±1 个数量级的一半）
    - linear：`[anchor - 0.25×range, anchor + 0.25×range]`，并 clip 到 [min, max]
 
-5. 写入 search_state.json 的 `candidates` 字段：
+5. 将 `search_phase` 更新为 `"multi_focused"`，写回 `search_state.json`。
+
+6. 写入 search_state.json 的 `candidates` 字段：
 
 ```json
 "candidates": [
@@ -93,40 +111,126 @@ experiment_count >= 5 → multi_focused（多起点 focused 搜索）
 "current_candidate_idx": 0
 ```
 
+7. **询问用户是否启用并行搜索模式**：
+   > 是否并行运行所有候选区域？（每轮同时提交 N 个作业，需要集群环境）[y/N]
+
+   - 若用户选 y 且 `scheduler != local` → 将 `"parallel_mode": true` 写入 search_state.json，后续切换至 SKILL.md 的并行循环流程
+   - 其余情况 → `"parallel_mode": false`，继续顺序循环
+
 ### multi_focused 阶段的搜索逻辑
 
 读取 `current_candidate_idx`，当前工作在对应的候选区域内：
 - 推荐的参数值必须落在当前候选的 focus 范围内
-- 每轮将本次 reward 追加到当前候选的 `recent_rewards`
+
+**每轮追加实验后，立即从 `experiment_log.jsonl` 重建当前候选的 `recent_rewards`**：
+
+```
+candidate.recent_rewards = [
+    entry.results.reward
+    for entry in experiment_log
+    if entry.candidate_id == current_candidate.id
+]
+```
+
+不依赖 search_state.json 中的历史 append，而是每轮从 log 派生，确保状态与日志始终一致。
+将重建后的 `recent_rewards` 写回 search_state.json 的对应候选字段。
 
 **候选切换**：若当前候选触发终止条件（见 4.4），将其 `converged = true`，
 `current_candidate_idx += 1`，切换到下一个候选，**不终止整体搜索**。
 
 **整体终止**：所有候选的 `converged` 均为 `true` 时，整体搜索结束。
 
+## 4.3b Focus Range 动态收窄
+
+**触发条件**：multi_focused 阶段，且当前候选在本轮结束后累计实验数 ≥ 5。
+
+**在并行模式下**：对每个活跃候选（converged=false）分别执行一次以下收窄逻辑，而非仅针对 current_candidate。
+
+**每轮结束后执行一次**（在推荐下一组参数前）：
+
+### 第一步：识别高价值实验
+
+从 `experiment_log.jsonl` 中取出当前候选的所有实验，计算：
+
+```
+candidate_best = max(当前候选所有实验的 reward)
+high_reward_threshold = candidate_best - 0.02
+high_reward_exps = [exp for exp in 当前候选实验 if exp.reward >= high_reward_threshold]
+```
+
+若 `len(high_reward_exps) < 3`：跳过本步骤（高价值样本不足，暂不收窄）。
+
+### 第二步：计算各参数的高价值区间
+
+对每个 tunable 参数，在 `high_reward_exps` 中取参数值：
+
+- **log scale 参数**：
+  ```
+  param_min = min(high_reward_exps[param])
+  param_max = max(high_reward_exps[param])
+  new_focus_min = param_min / 1.3   # 向外扩 buffer
+  new_focus_max = param_max * 1.3
+  ```
+
+- **linear 参数**：
+  ```
+  param_min = min(high_reward_exps[param])
+  param_max = max(high_reward_exps[param])
+  focus_width = current_focus_max - current_focus_min
+  new_focus_min = param_min - 0.15 * focus_width
+  new_focus_max = param_max + 0.15 * focus_width
+  ```
+
+### 第三步：应用约束并决定是否更新
+
+对每个参数的新 focus 范围：
+
+1. **Clip 到当前 focus**：`new_focus_min = max(new_focus_min, current_focus_min)`，`new_focus_max = min(new_focus_max, current_focus_max)`（只能收窄，不能扩张）
+2. **最小宽度保护**：若新 focus 宽度 < 当前 focus 宽度的 20%，保持当前 focus 不变（防止过度收窄导致采样空间崩溃）
+   - log scale 宽度 = `log(max) - log(min)`
+   - linear 宽度 = `max - min`
+3. **只有真正收窄才更新**：若新 `focus_min > current_focus_min` 或 `new_focus_max < current_focus_max`，则更新 search_state.json 中该候选的对应参数 focus 范围
+
+### 第四步：输出收窄日志
+
+若任意参数的 focus 发生了变化，输出：
+
+```
+[Focus 收窄] 候选 {candidate_id}，基于 {len(high_reward_exps)} 个高价值实验（reward ≥ {threshold:.4f}）：
+  {param_1}: [{旧min}, {旧max}] → [{新min}, {新max}]
+  {param_2}: 无变化
+  ...
+```
+
+若没有任何参数发生变化，不输出（静默跳过）。
+
 ## 4.4 终止条件检查
 
-**确定窗口大小 K 和阈值 δ**（按当前搜索阶段）：
-- exploration 阶段：K=3，δ=0.02
-- multi_focused 阶段：K=5，δ=0.01
+**仅在 multi_focused 阶段执行**（exploration 阶段通过 experiment_count=5 强制切换，无需终止判断）。
 
-**检查当前候选的 recent_rewards**：
+**K = 5**（multi_focused 阶段固定值）。
+
+**在并行模式下**：对每个活跃候选分别独立执行以下终止判断（使用各自的 recent_rewards），而非仅针对 current_candidate。
+
+**从重建后的 `recent_rewards` 中做终止判断**：
 
 **若长度 < K**：跳过终止判断，继续。
 
 **若长度 ≥ K**：
 ```
-window = current_candidate.recent_rewards[-K:]
-improvement = max(window) - min(window)
+recent_rewards = current_candidate.recent_rewards
+
+candidate_best = max(recent_rewards)
+first_best_idx = recent_rewards.index(candidate_best)   # 仅取第一次出现的下标
+post_best_count = len(recent_rewards) - first_best_idx - 1
 ```
 
-**采样均匀性检查**：对 window 对应的最近 K 次实验，
-若任意一个 tunable 参数的取值标准差 < 该参数当前 focus 范围的 5%，
-视为"集中采样"，不触发终止。
-
 **终止判断**：
-- improvement < δ 且采样均匀 → 当前候选 `converged = true`
-- 否则 → 继续当前候选
+
+- `post_best_count >= K`
+  → 自候选首次达到 `candidate_best` 起，后续已完成 K 次实验且无一严格超越该值
+  → 当前候选 `converged = true`
+- 否则：继续当前候选
 
 将更新后状态写回 `~/.claude/skills/param-tune/memory/search_state.json`。
 
@@ -134,7 +238,11 @@ improvement = max(window) - min(window)
 
 **若仍有未收敛的候选**：
 
-在当前候选的 focus 范围内推荐下一组参数，优先覆盖该候选区域内的空白子区域。
+读取 search_state.json 中的 `parallel_mode`：
+
+**顺序模式（parallel_mode = false）**：
+
+在当前候选（`current_candidate_idx` 对应）的 focus 范围内推荐下一组参数，优先覆盖该候选区域内的空白子区域。
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -152,7 +260,34 @@ improvement = max(window) - min(window)
 候选 {id} 已收敛（best_reward={值}），切换到候选 {next_id}（锚点：{exp_id}）
 ```
 
+**并行模式（parallel_mode = true）**：
+
+为所有 converged=false 的候选分别生成推荐配置，各自在其 focus 范围内采样，优先覆盖本候选区域内的空白子区域。
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+推荐实验配置（本轮并行，共 N 个活跃候选）   [阶段: multi_focused]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[候选区域: candidate_A]
+  {param_1} : {值}    [{推荐理由}]
+  {param_2} : {值}    [{推荐理由}]
+
+[候选区域: candidate_B]
+  {param_1} : {值}    [{推荐理由}]
+  {param_2} : {值}    [{推荐理由}]
+
+推荐理由综述：{2-3句话，说明各候选的探索方向}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+本轮某候选收敛时额外输出（该候选不再出现在下一轮推荐中）：
+```
+候选 {id} 已收敛（best_reward={值}），下一轮不再提交该候选
+```
+
 **若所有候选均已收敛**：
+
+将 `search_state.json` 中的 `termination_triggered` 设为 `true`，`search_phase` 设为 `"terminated"`，写回文件。
 
 读取 `experiment_log.jsonl` 中的全部记录，找出 `reward` 字段最大的实验作为全局最优。
 **不以窗口内最优为准，而是扫描所有历史实验取全局最大值。**
