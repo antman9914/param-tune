@@ -57,11 +57,42 @@ exp_id 编号 = experiment_count + 1，格式 exp_001, exp_002 ...
 ### 阶段定义
 
 ```
-experiment_count < 5  → exploration（全范围随机采样）
-experiment_count >= 5 → multi_focused（多起点 focused 搜索）
+search_phase == "exploration" → 全范围随机采样，每轮结束后评估是否切换
+search_phase == "multi_focused" → 多起点 focused 搜索
 ```
 
-### exploration → multi_focused 切换（仅在 experiment_count 首次达到 5 时执行）
+### exploration 阶段的切换评估（每轮 exploration 结束后执行）
+
+**最少轮次保护**：若 exploration 实验数 < 3，直接继续 exploration，不做评估。
+
+**强制切换上限**：若 exploration 实验数 ≥ 12，无论评估结果如何，强制切换至 multi_focused。
+
+**3 ≤ 实验数 < 12 时**，评估以下两项标准，**全部满足则切换**：
+
+1. **奖励区分度**：`max(rewards) - min(rewards) ≥ 0.02`
+   → 说明搜索空间内存在可区分的高低值区域，有方向性信号
+
+2. **参数覆盖度**：至少有 1 个 tunable 参数在已有实验中覆盖了 ≥ 3 个不同子区间
+   → 避免采样点全部聚集在一处，导致锚点选择缺乏全局视野
+   （子区间定义：将该参数的搜索范围等分为 4 段；log scale 参数按对数均匀划分；落入的段数 ≥ 3 即满足）
+
+**候选 B 可行性**不作为切换的必要条件，而是决定切换后使用**双候选**还是**单候选**模式：
+- 在满足质量门槛（`reward ≥ max_reward × 0.95`）的实验中，
+  存在与候选 A 归一化距离 ≥ 0.2 的实验 → 双候选模式
+- 否则 → single-candidate 模式（只保留候选 A）
+
+**若两项标准未全部满足**，继续 exploration，并在推荐下一组参数时，
+优先选择当前**覆盖最少的子区域**（最远离已有采样点的区域），提升后续评估成功率。
+
+输出评估摘要：
+```
+[Exploration 评估 — 第 N 轮]
+奖励区分度：{max:.4f} - {min:.4f} = {spread:.4f}  {"✓" if >= 0.02 else "✗（继续探索）"}
+参数覆盖度：{param_1} 覆盖 {M}/4 子区间  {"✓" if >= 3 else "✗"}
+→ {"切换至 multi_focused（双候选）" / "切换至 multi_focused（单候选，无合适的候选B）" / "继续 exploration，下一轮优先覆盖：{区域描述}"}
+```
+
+### exploration → multi_focused 切换（评估通过时执行）
 
 **从历史实验中选出 2 个候选起点（最远点采样）：**
 
@@ -206,7 +237,7 @@ high_reward_exps = [exp for exp in 当前候选实验 if exp.reward >= high_rewa
 
 ## 4.4 终止条件检查
 
-**仅在 multi_focused 阶段执行**（exploration 阶段通过 experiment_count=5 强制切换，无需终止判断）。
+**仅在 multi_focused 阶段执行**（exploration 阶段通过评估条件或达到12轮上限时切换，无需终止判断）。
 
 **K = 5**（multi_focused 阶段固定值）。
 
@@ -231,6 +262,8 @@ post_best_count = len(recent_rewards) - first_best_idx - 1
   → 自候选首次达到 `candidate_best` 起，后续已完成 K 次实验且无一严格超越该值
   → 当前候选 `converged = true`
 - 否则：继续当前候选
+
+> **说明**：收敛与否取决于"自首次达到最优以来经过了多少轮"，与后续轮次是否再次达到该最优值无关。在终止报告中应准确描述为"距首次达到最优已过 K 轮"，而非"某轮达到最优触发了收敛"。
 
 将更新后状态写回 `~/.claude/skills/param-tune/memory/search_state.json`。
 
